@@ -17,18 +17,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [loading, setLoading] = useState(true)
 
-  const fetchUserProfile = useCallback(async (authUserId: string) => {
-    const { data, error } = await supabase
-      .from('users')
-      .select('*, team:teams(*)')
-      .eq('id', authUserId)
-      .single()
+  const fetchUserProfile = useCallback(async (authUserId: string): Promise<User | null> => {
+    // Retry up to 3 times — user row may not exist yet (trigger delay)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { data, error } = await supabase
+        .from('users')
+        .select('*, team:teams(*)')
+        .eq('id', authUserId)
+        .single()
 
-    if (error) {
+      if (data) return data as User
+
+      if (error?.code === 'PGRST116') {
+        // Row not found yet — wait and retry
+        await new Promise((r) => setTimeout(r, 800))
+        continue
+      }
+
       console.error('Error fetching user profile:', error)
       return null
     }
-    return data as User
+    return null
   }, [])
 
   const refreshUser = useCallback(async () => {
@@ -40,24 +49,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [fetchUserProfile])
 
   useEffect(() => {
-    // Get initial session
-    supabase.auth.getSession().then(async ({ data: { session } }) => {
-      if (session?.user) {
-        const profile = await fetchUserProfile(session.user.id)
-        setUser(profile)
+    // Handle OAuth callback — Supabase exchanges the code automatically
+    // We just need to listen for the SIGNED_IN event
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        if (event === 'SIGNED_IN' && session?.user) {
+          const profile = await fetchUserProfile(session.user.id)
+          setUser(profile)
+          setLoading(false)
+        } else if (event === 'SIGNED_OUT') {
+          setUser(null)
+          setLoading(false)
+        } else if (event === 'INITIAL_SESSION') {
+          if (session?.user) {
+            const profile = await fetchUserProfile(session.user.id)
+            setUser(profile)
+          }
+          setLoading(false)
+        }
       }
-      setLoading(false)
-    })
-
-    // Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      if (event === 'SIGNED_IN' && session?.user) {
-        const profile = await fetchUserProfile(session.user.id)
-        setUser(profile)
-      } else if (event === 'SIGNED_OUT') {
-        setUser(null)
-      }
-    })
+    )
 
     return () => subscription.unsubscribe()
   }, [fetchUserProfile])
@@ -66,8 +77,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: {
-        redirectTo: window.location.origin,
-        queryParams: { access_type: 'offline', prompt: 'consent' },
+        // Must match exactly what's in Supabase → Auth → URL Configuration
+        redirectTo: `${window.location.origin}/`,
+        queryParams: {
+          access_type: 'offline',
+          prompt: 'select_account',
+        },
       },
     })
   }
